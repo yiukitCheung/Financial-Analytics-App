@@ -1,5 +1,8 @@
 /.streamlit
 /__pycache__
+**/__pycache__
 config/mongo.yaml
 .env
 .venv
+.DS_Store
+.idea/
