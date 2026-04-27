@@ -1,26 +1,28 @@
-"""CondVest — Financial Analytics App
+"""TradLyte — Financial Analytics App
 
 A light, focused dashboard for discovering what to buy based on saved
 strategy picks, with live technical-indicator analysis on any US equity.
+
+All data is loaded via the serving HTTP API (see [api] in secrets.toml).
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, date
-from typing import Optional
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime
+from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-import psycopg2
+import requests
 import streamlit as st
 from plotly.subplots import make_subplots
-from psycopg2.extras import RealDictCursor
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Page config
 # ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="CondVest — Financial Analytics",
+    page_title="TradLyte — Financial Analytics",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -166,156 +168,249 @@ PLOTLY_LAYOUT = dict(
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DB
+# API client
 # ─────────────────────────────────────────────────────────────────────────────
+class APIError(RuntimeError):
+    pass
+
+
 @st.cache_resource
-def get_pg():
-    cfg = st.secrets["postgres"]
-    conn = psycopg2.connect(
-        host=cfg["host"],
-        port=cfg["port"],
-        dbname=cfg["db_name_postgres"],
-        user=cfg["user"],
-        password=cfg["password"],
-        sslmode="require",
-    )
-    conn.autocommit = True
-    return conn
+def get_session() -> requests.Session:
+    """Single keep-alive HTTP session for all API calls."""
+    cfg = st.secrets["api"]
+    s = requests.Session()
+    s.headers.update({"Accept": "application/json"})
+    if cfg.get("api_key"):
+        s.headers["x-api-key"] = cfg["api_key"]
+    return s
+
+
+def _api_get(path: str, params: Optional[dict] = None) -> dict:
+    cfg = st.secrets["api"]
+    base = cfg["base_url"].rstrip("/")
+    url = f"{base}{path}"
+    timeout = float(cfg.get("timeout", 15))
+    try:
+        r = get_session().get(url, params=params, timeout=timeout)
+    except requests.RequestException as e:
+        raise APIError(f"Network error calling {path}: {e}") from e
+    if r.status_code >= 400:
+        try:
+            err = r.json().get("error", {}).get("message") or r.text[:300]
+        except Exception:
+            err = r.text[:300]
+        hint = ""
+        if r.status_code == 403:
+            hint = "  (hint: API key may be required — check [api].api_key in .streamlit/secrets.toml)"
+        elif r.status_code == 404:
+            hint = "  (hint: path or symbol not found — check API base_url and arguments)"
+        raise APIError(f"{r.status_code} {path}: {err}{hint}")
+    return r.json()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Loaders
+# Loaders (API-backed)
 # ─────────────────────────────────────────────────────────────────────────────
-@st.cache_data(ttl=600)
-def load_symbols() -> list[str]:
-    with get_pg().cursor() as cur:
-        cur.execute(
-            "SELECT DISTINCT symbol FROM symbol_metadata WHERE type='CS' ORDER BY symbol"
+@st.cache_data(ttl=300, show_spinner=False)
+def api_health() -> dict:
+    return _api_get("/health")
+
+
+@st.cache_data(ttl=3600, show_spinner="Loading symbols…")
+def load_symbol_universe(max_pages: int = 20) -> pd.DataFrame:
+    """Paginate /screener/quotes (type=CS) to build the searchable symbol list.
+
+    Cached for an hour; small per-symbol payload, so a few hundred rows is cheap.
+    """
+    rows: list[dict] = []
+    offset = 0
+    page_size = 500
+    for _ in range(max_pages):
+        payload = _api_get(
+            "/screener/quotes",
+            params={
+                "type": "CS",
+                "limit": page_size,
+                "offset": offset,
+                "sort": "marketcap:desc",
+            },
         )
-        return [r[0] for r in cur.fetchall()]
+        data = payload.get("data", []) or []
+        rows.extend(data)
+        if len(data) < page_size:
+            break
+        offset += page_size
+    if not rows:
+        return pd.DataFrame(columns=["symbol", "name", "industry", "market_cap",
+                                     "primary_exchange"])
+    df = pd.DataFrame(rows)
+    keep = ["symbol", "name", "industry", "market_cap", "primary_exchange"]
+    return df[[c for c in keep if c in df.columns]].drop_duplicates("symbol")
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=300, show_spinner=False)
 def load_ohlcv(symbol: str, days: int = 365) -> pd.DataFrame:
-    since = datetime.now() - timedelta(days=days)
-    with get_pg().cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(
-            """
-            SELECT timestamp AS date, open, high, low, close, volume
-            FROM raw_ohlcv
-            WHERE symbol = %s AND timestamp >= %s AND interval = '1d'
-            ORDER BY timestamp ASC
-            """,
-            (symbol, since),
-        )
-        df = pd.DataFrame(cur.fetchall())
-    if df.empty:
-        return df
-    df["date"] = pd.to_datetime(df["date"])
-    for c in ("open", "high", "low", "close"):
-        df[c] = df[c].astype(float)
-    df["volume"] = df["volume"].astype(float)
-    return df
-
-
-@st.cache_data(ttl=300)
-def load_index(symbol: str, days: int = 90) -> pd.DataFrame:
-    since = datetime.now() - timedelta(days=days)
-    with get_pg().cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(
-            """
-            SELECT timestamp AS date, close
-            FROM raw_ohlcv
-            WHERE symbol = %s AND timestamp >= %s AND interval = '1d'
-            ORDER BY timestamp ASC
-            """,
-            (symbol, since),
-        )
-        df = pd.DataFrame(cur.fetchall())
-    if df.empty:
-        return df
-    df["date"] = pd.to_datetime(df["date"])
-    df["close"] = df["close"].astype(float)
-    return df
-
-
-@st.cache_data(ttl=600)
-def load_symbol_meta(symbol: str) -> dict:
-    with get_pg().cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(
-            """
-            SELECT name, industry, marketcap, primary_exchange
-            FROM symbol_metadata WHERE symbol = %s LIMIT 1
-            """,
-            (symbol,),
-        )
-        row = cur.fetchone()
-        return dict(row) if row else {}
-
-
-@st.cache_data(ttl=300)
-def load_pick_dates(limit: int = 60) -> list[date]:
-    with get_pg().cursor() as cur:
-        cur.execute(
-            """
-            SELECT DISTINCT scan_date FROM stock_picks
-            ORDER BY scan_date DESC LIMIT %s
-            """,
-            (limit,),
-        )
-        return [r[0] for r in cur.fetchall()]
-
-
-@st.cache_data(ttl=600)
-def load_strategies() -> list[str]:
-    with get_pg().cursor() as cur:
-        cur.execute("SELECT DISTINCT strategy_name FROM stock_picks ORDER BY strategy_name")
-        return [r[0] for r in cur.fetchall()]
-
-
-@st.cache_data(ttl=300)
-def load_picks(scan_dt: date, strategy: str, limit: int = 25) -> pd.DataFrame:
-    """Picks for a date + strategy, joined with symbol metadata + latest close.
-
-    Return calc note:  uses stored `price` (pick-day price) vs latest close from
-    raw_ohlcv. To swap in your SQL procedure later, replace the `latest_close`
-    CTE with: `LEFT JOIN <your_proc>(symbol, scan_date) ...`.
-    """
-    sql = """
-        WITH p AS (
-            SELECT symbol, strategy_name, signal, price, confidence, rank, scan_date
-            FROM stock_picks
-            WHERE scan_date = %(d)s AND strategy_name = %(s)s
-            ORDER BY rank ASC
-            LIMIT %(lim)s
-        ),
-        latest_close AS (
-            SELECT DISTINCT ON (symbol) symbol, close, timestamp
-            FROM raw_ohlcv
-            WHERE interval='1d' AND symbol IN (SELECT symbol FROM p)
-            ORDER BY symbol, timestamp DESC
-        )
-        SELECT
-            p.rank, p.symbol, p.signal, p.price::float AS pick_price,
-            p.confidence::float AS confidence,
-            COALESCE(lc.close::float, NULL) AS current_price,
-            sm.name, sm.industry, sm.marketcap
-        FROM p
-        LEFT JOIN latest_close lc ON lc.symbol = p.symbol
-        LEFT JOIN symbol_metadata sm ON sm.symbol = p.symbol
-        ORDER BY p.rank ASC
-    """
-    with get_pg().cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(sql, {"d": scan_dt, "s": strategy, "lim": limit})
-        df = pd.DataFrame(cur.fetchall())
-    if df.empty:
-        return df
-    df["return_pct"] = np.where(
-        df["current_price"].notna() & (df["pick_price"] > 0),
-        (df["current_price"] - df["pick_price"]) / df["pick_price"] * 100.0,
-        np.nan,
+    payload = _api_get(
+        f"/market/ohlcv/{symbol}",
+        params={
+            "interval": "1d",
+            "limit": min(max(days, 1), 2000),
+            "sort": "asc",
+        },
     )
-    return df
+    data = payload.get("data", []) or []
+    if not data:
+        return pd.DataFrame()
+    df = pd.DataFrame(data)
+    df["date"] = pd.to_datetime(df.get("trading_date", df.get("timestamp")))
+    for c in ("open", "high", "low", "close", "volume"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
+    return df[["date", "open", "high", "low", "close", "volume"]]
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_index(symbol: str, days: int = 90) -> pd.DataFrame:
+    df = load_ohlcv(symbol, days=days)
+    if df.empty:
+        return df
+    return df[["date", "close"]]
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_symbol_meta(symbol: str) -> dict:
+    """Fast path: pull from cached universe; fall back to /market/quote/{symbol}."""
+    universe = load_symbol_universe()
+    hit = universe.loc[universe["symbol"] == symbol]
+    if not hit.empty:
+        row = hit.iloc[0].to_dict()
+        return {
+            "name": row.get("name"),
+            "industry": row.get("industry"),
+            "marketcap": row.get("market_cap"),
+            "primary_exchange": row.get("primary_exchange"),
+        }
+    try:
+        payload = _api_get(f"/market/quote/{symbol}")
+        d = payload.get("data") or {}
+        return {
+            "name": d.get("name"),
+            "industry": d.get("industry"),
+            "marketcap": d.get("market_cap"),
+            "primary_exchange": d.get("primary_exchange"),
+        }
+    except APIError:
+        return {}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_picks_today(limit: int = 100) -> dict:
+    """Returns the raw `/picks/today` payload (data + meta)."""
+    return _api_get("/picks/today", params={"limit": limit})
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_picks_returns(scan_dt: date, horizons: str = "1,5,21") -> dict:
+    """Returns the raw `/picks/{scan_date}/returns` payload (data + meta)."""
+    return _api_get(
+        f"/picks/{scan_dt.isoformat()}/returns",
+        params={"horizons": horizons},
+    )
+
+
+def _enrich_picks(picks_df: pd.DataFrame) -> pd.DataFrame:
+    """Attach name + industry + market_cap to each pick using the cached
+    universe first, then per-symbol /market/quote fallback for misses."""
+    if picks_df.empty:
+        return picks_df
+    universe = load_symbol_universe()
+    uni = universe.set_index("symbol") if not universe.empty else pd.DataFrame()
+
+    names, industries, caps = [], [], []
+    misses: list[str] = []
+    for sym in picks_df["symbol"]:
+        if not uni.empty and sym in uni.index:
+            r = uni.loc[sym]
+            names.append(r.get("name"))
+            industries.append(r.get("industry"))
+            caps.append(r.get("market_cap"))
+        else:
+            names.append(None)
+            industries.append(None)
+            caps.append(None)
+            misses.append(sym)
+
+    if misses:
+        def _fetch(sym: str) -> tuple[str, dict]:
+            return sym, load_symbol_meta(sym)
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            for sym, meta in ex.map(_fetch, misses):
+                idx = picks_df.index[picks_df["symbol"] == sym]
+                for i in idx:
+                    pos = picks_df.index.get_loc(i)
+                    names[pos] = meta.get("name")
+                    industries[pos] = meta.get("industry")
+                    caps[pos] = meta.get("marketcap")
+
+    out = picks_df.copy()
+    out["name"] = names
+    out["industry"] = industries
+    out["marketcap"] = caps
+    return out
+
+
+def load_picks(scan_dt: date, strategy: Optional[str], limit: int = 25) -> pd.DataFrame:
+    """Picks for a date, optionally filtered by strategy, with name/industry
+    enriched and `return_pct` derived from the API's `return_to_date`.
+    """
+    payload = load_picks_returns(scan_dt)
+    rows: list[dict[str, Any]] = payload.get("data", []) or []
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    if strategy:
+        df = df[df["strategy_name"] == strategy]
+    if df.empty:
+        return df
+    df = df.sort_values("rank").head(limit).reset_index(drop=True)
+
+    df["pick_price"] = pd.to_numeric(df.get("pick_price"), errors="coerce")
+    df["current_price"] = pd.to_numeric(df.get("close_now"), errors="coerce")
+    df["return_pct"] = pd.to_numeric(df.get("return_to_date"), errors="coerce") * 100.0
+
+    if "metadata" in df.columns:
+        df["confidence"] = df["metadata"].apply(
+            lambda m: (m or {}).get("ranking_score") if isinstance(m, dict) else None
+        )
+    else:
+        df["confidence"] = np.nan
+    df["confidence"] = pd.to_numeric(df["confidence"], errors="coerce")
+
+    df = _enrich_picks(df)
+    return df[[
+        "rank", "symbol", "signal", "strategy_name", "pick_price", "current_price",
+        "return_pct", "confidence", "name", "industry", "marketcap",
+    ]]
+
+
+def discover_pick_context() -> tuple[Optional[date], list[str]]:
+    """Use /picks/today to find the latest scan_date and known strategies."""
+    try:
+        payload = load_picks_today(limit=200)
+    except APIError:
+        return None, []
+    meta = payload.get("meta") or {}
+    rows = payload.get("data") or []
+    scan_dt: Optional[date] = None
+    sd = meta.get("scan_date")
+    if sd:
+        try:
+            scan_dt = datetime.strptime(sd, "%Y-%m-%d").date()
+        except ValueError:
+            scan_dt = None
+    strategies = sorted({r.get("strategy_name") for r in rows if r.get("strategy_name")})
+    return scan_dt, strategies
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -619,11 +714,12 @@ def main():
     if "indicators" not in st.session_state:
         st.session_state.indicators = ["SMA 20", "SMA 50"]
 
+
     # ── Brand header ─────────────────────────────────────────────────────────
     st.markdown(
         """
         <div class="brand-row">
-          <div class="brand-title">CondVest</div>
+          <div class="brand-title">TradLyte</div>
           <div class="brand-tag">Financial Analytics</div>
         </div>
         <div class="brand-sub">
@@ -642,9 +738,9 @@ def main():
     with rail:
         st.markdown('<p class="eyebrow">Market Pulse</p>', unsafe_allow_html=True)
         for sym, label, color in [
-            ("^GSPC", "S&P 500",    ACCENT),
-            ("^IXIC", "NASDAQ",     "#42a5f5"),
-            ("^DJI",  "Dow Jones",  "#ab47bc"),
+            ("SPY",  "S&P 500",   ACCENT),
+            ("QQQ",  "NASDAQ",    "#42a5f5"),
+            ("DJIA", "Dow Jones", "#ab47bc"),
         ]:
             idx_df = load_index(sym)
             if idx_df.empty:
@@ -659,7 +755,8 @@ def main():
         # Search + indicator controls
         c_search, c_ind = st.columns([2, 3], gap="medium")
         with c_search:
-            symbols = load_symbols()
+            universe = load_symbol_universe()
+            symbols = universe["symbol"].tolist() if not universe.empty else []
             if st.session_state.symbol not in symbols:
                 symbols = [st.session_state.symbol] + symbols
             idx = symbols.index(st.session_state.symbol)
@@ -702,32 +799,34 @@ def main():
     # ── Bottom: Picks of the Day ─────────────────────────────────────────────
     st.markdown('<p class="eyebrow">Picks of the Day</p>', unsafe_allow_html=True)
 
-    pick_dates = load_pick_dates()
-    strategies = load_strategies()
-    if not pick_dates or not strategies:
+    latest_dt, strategies = discover_pick_context()
+    if latest_dt is None and not strategies:
         st.markdown('<span class="muted">No picks available yet.</span>',
                     unsafe_allow_html=True)
         return
 
+    default_dt = latest_dt or date.today()
+    strategy_options = ["All strategies"] + strategies
+
     c_date, c_strat, c_count = st.columns([1.2, 1.5, 1], gap="medium")
     with c_date:
-        scan_dt = st.selectbox(
+        scan_dt = st.date_input(
             "Pick date",
-            options=pick_dates,
-            index=0,
-            format_func=lambda d: d.strftime("%a, %b %d, %Y") + (
-                "  • latest" if d == pick_dates[0] else ""
-            ),
+            value=default_dt,
+            max_value=date.today(),
+            format="YYYY-MM-DD",
             key="pick_date",
+            help=f"Latest scan: {latest_dt.isoformat()}" if latest_dt else None,
         )
     with c_strat:
-        strategy = st.selectbox(
+        strategy_label = st.selectbox(
             "Strategy",
-            options=strategies,
+            options=strategy_options,
             index=0,
-            format_func=lambda s: s.replace("_", " ").title(),
+            format_func=lambda s: s if s == "All strategies" else s.replace("_", " ").title(),
             key="pick_strategy",
         )
+        strategy = None if strategy_label == "All strategies" else strategy_label
     with c_count:
         top_n = st.selectbox("Top N", [10, 25, 50, 100], index=1, key="pick_topn")
 
