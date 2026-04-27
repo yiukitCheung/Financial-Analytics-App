@@ -7,6 +7,7 @@ All data is loaded via the serving HTTP API (see [api] in secrets.toml).
 """
 from __future__ import annotations
 
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 from typing import Any, Optional
@@ -17,6 +18,40 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 from plotly.subplots import make_subplots
+
+try:
+    from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
+except Exception:  # pragma: no cover — fallback for older Streamlit
+    def add_script_run_ctx(thread=None, ctx=None):  # type: ignore[no-redef]
+        return None
+
+    def get_script_run_ctx():  # type: ignore[no-redef]
+        return None
+
+
+def _parallel(jobs: dict[str, tuple]) -> dict[str, Any]:
+    """Run independent loaders concurrently with Streamlit ctx propagated.
+
+    `jobs` maps result-key -> (callable, args, kwargs). Returns key -> result
+    or the raised Exception, never raises.
+    """
+    ctx = get_script_run_ctx()
+
+    def _init():
+        if ctx is not None:
+            add_script_run_ctx(threading.current_thread(), ctx)
+
+    results: dict[str, Any] = {}
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(jobs))),
+                            initializer=_init) as ex:
+        futures = {k: ex.submit(fn, *args, **(kwargs or {}))
+                   for k, (fn, args, kwargs) in jobs.items()}
+        for k, f in futures.items():
+            try:
+                results[k] = f.result()
+            except Exception as e:  # noqa: BLE001 — capture per-job
+                results[k] = e
+    return results
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Page config
@@ -65,6 +100,33 @@ html, body, [data-testid="stAppViewContainer"] {{
 .eyebrow {{
     font-size: 11px; font-weight: 700; letter-spacing: 0.14em;
     color: {MUTED}; text-transform: uppercase; margin: 0 0 8px 2px;
+}}
+.rail-group {{
+    font-size: 10px; font-weight: 700; letter-spacing: 0.16em;
+    color: rgba(255,255,255,0.36); text-transform: uppercase;
+    margin: 12px 0 4px 2px;
+}}
+
+/* Range preset radio → segmented-control look */
+div[data-testid="stRadio"] > div[role="radiogroup"] {{
+    flex-direction: row !important; gap: 0 !important;
+    justify-content: flex-end;
+    background: {CARD}; border: 1px solid {BORDER};
+    border-radius: 10px; padding: 3px; width: fit-content;
+    margin-left: auto;
+}}
+div[data-testid="stRadio"] label {{
+    padding: 4px 14px !important;
+    border-radius: 7px !important;
+    font-size: 12px !important; font-weight: 600 !important;
+    color: {MUTED} !important; cursor: pointer;
+    transition: all .12s ease;
+}}
+div[data-testid="stRadio"] label:hover {{ color: #e7ebf3 !important; }}
+div[data-testid="stRadio"] label > div:first-child {{ display: none !important; }}
+div[data-testid="stRadio"] label:has(input:checked) {{
+    background: rgba(0,212,170,0.14) !important;
+    color: {ACCENT} !important;
 }}
 
 /* Card */
@@ -216,34 +278,28 @@ def api_health() -> dict:
     return _api_get("/health")
 
 
-@st.cache_data(ttl=3600, show_spinner="Loading symbols…")
-def load_symbol_universe(max_pages: int = 20) -> pd.DataFrame:
-    """Paginate /screener/quotes (type=CS) to build the searchable symbol list.
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_symbol_universe(limit: int = 500) -> pd.DataFrame:
+    """Top-N symbols by market cap (one page) for the search dropdown.
 
-    Cached for an hour; small per-symbol payload, so a few hundred rows is cheap.
+    Cached for an hour. Picks whose symbol is outside this list are still
+    enriched on demand via `/market/quote/{symbol}` in `_enrich_picks`, so
+    nothing is lost by skipping deep pagination.
     """
-    rows: list[dict] = []
-    offset = 0
-    page_size = 500
-    for _ in range(max_pages):
-        payload = _api_get(
-            "/screener/quotes",
-            params={
-                "type": "CS",
-                "limit": page_size,
-                "offset": offset,
-                "sort": "marketcap:desc",
-            },
-        )
-        data = payload.get("data", []) or []
-        rows.extend(data)
-        if len(data) < page_size:
-            break
-        offset += page_size
-    if not rows:
+    payload = _api_get(
+        "/screener/quotes",
+        params={
+            "type": "CS",
+            "limit": min(max(limit, 1), 500),
+            "offset": 0,
+            "sort": "marketcap:desc",
+        },
+    )
+    data = payload.get("data", []) or []
+    if not data:
         return pd.DataFrame(columns=["symbol", "name", "industry", "market_cap",
                                      "primary_exchange"])
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(data)
     keep = ["symbol", "name", "industry", "market_cap", "primary_exchange"]
     return df[[c for c in keep if c in df.columns]].drop_duplicates("symbol")
 
@@ -418,18 +474,44 @@ def discover_pick_context() -> tuple[Optional[date], list[str]]:
 # ─────────────────────────────────────────────────────────────────────────────
 INDICATOR_TYPES = {
     # name -> (kind, color)  kind: "overlay" or "subplot_rsi" or "subplot_macd" or "overlay_band"
+    # SMAs
     "SMA 20":          ("overlay",      "#42a5f5"),
     "SMA 50":          ("overlay",      "#ab47bc"),
     "SMA 200":         ("overlay",      "#ff7043"),
+    # Short EMAs
+    "EMA 8":           ("overlay",      "#66bb6a"),
+    "EMA 13":          ("overlay",      "#c0ca33"),
     "EMA 20":          ("overlay",      "#26c6da"),
     "EMA 50":          ("overlay",      "#ffca28"),
+    # Long EMAs (Vegas channel)
+    "EMA 144":         ("overlay",      "#e53935"),
+    "EMA 169":         ("overlay",      "#7e57c2"),
+    # Other overlays
     "VWAP":            ("overlay",      "#ec407a"),
     "Bollinger Bands": ("overlay_band", "#90caf9"),
+    # Subplots
     "RSI 14":          ("subplot_rsi",  "#ffca28"),
     "MACD":            ("subplot_macd", "#26c6da"),
 }
 INDICATOR_NAMES = list(INDICATOR_TYPES.keys())
 MAX_INDICATORS = 4
+
+# ── Chart time-range presets ─────────────────────────────────────────────────
+RANGE_OPTIONS = ["YTD", "1Y", "3Y", "5Y"]
+
+
+def _range_to_days(label: str) -> int:
+    """Map a preset label to a calendar-day window for /market/ohlcv?limit=…"""
+    today = date.today()
+    if label == "YTD":
+        return max((today - date(today.year, 1, 1)).days, 30)
+    if label == "1Y":
+        return 365
+    if label == "3Y":
+        return 365 * 3
+    if label == "5Y":
+        return 365 * 5
+    return 365
 
 
 def _sma(s: pd.Series, n: int) -> pd.Series:
@@ -449,10 +531,18 @@ def compute_indicator(df: pd.DataFrame, name: str) -> dict:
         out["series"] = _sma(close, 50)
     elif name == "SMA 200":
         out["series"] = _sma(close, 200)
+    elif name == "EMA 8":
+        out["series"] = _ema(close, 8)
+    elif name == "EMA 13":
+        out["series"] = _ema(close, 13)
     elif name == "EMA 20":
         out["series"] = _ema(close, 20)
     elif name == "EMA 50":
         out["series"] = _ema(close, 50)
+    elif name == "EMA 144":
+        out["series"] = _ema(close, 144)
+    elif name == "EMA 169":
+        out["series"] = _ema(close, 169)
     elif name == "VWAP":
         tp = (df["high"] + df["low"] + df["close"]) / 3.0
         out["series"] = (tp * df["volume"]).cumsum() / df["volume"].cumsum().replace(0, np.nan)
@@ -712,8 +802,9 @@ def main():
     if "symbol" not in st.session_state:
         st.session_state.symbol = "AAPL"
     if "indicators" not in st.session_state:
-        st.session_state.indicators = ["SMA 20", "SMA 50"]
-
+        st.session_state.indicators = ["EMA 8", "EMA 13", "EMA 144", "EMA 169"]
+    if "chart_range" not in st.session_state:
+        st.session_state.chart_range = "1Y"
 
     # ── Brand header ─────────────────────────────────────────────────────────
     st.markdown(
@@ -732,30 +823,59 @@ def main():
     )
     st.markdown("<hr/>", unsafe_allow_html=True)
 
+    # ── Concurrent preload: indices + universe + main OHLCV + picks_today ────
+    symbol = st.session_state.symbol
+    chart_days = _range_to_days(st.session_state.chart_range)
+
+    MARKET_PULSE = [
+        ("Indices", [
+            ("SPY",  "S&P 500",   ACCENT),
+            ("QQQ",  "NASDAQ",    "#42a5f5"),
+            ("DJIA", "Dow Jones", "#ab47bc"),
+        ]),
+        ("Commodities", [
+            ("GLD", "Gold",      "#ffd54f"),
+            ("SLV", "Silver",    "#bdbdbd"),
+            ("USO", "Crude Oil", "#ff8a65"),
+        ]),
+    ]
+    pulse_symbols = [s for _, items in MARKET_PULSE for (s, _, _) in items]
+
+    with st.spinner("Loading market data…"):
+        preload = _parallel({
+            "universe":    (load_symbol_universe, (), None),
+            "ohlcv":       (load_ohlcv, (symbol, chart_days), None),
+            "picks_today": (load_picks_today, (), {"limit": 200}),
+            **{f"idx:{s}": (load_index, (s, 90), None) for s in pulse_symbols},
+        })
+
+    def _df_or_empty(key: str) -> pd.DataFrame:
+        v = preload.get(key)
+        return v if isinstance(v, pd.DataFrame) else pd.DataFrame()
+
     # ── Top: Market pulse (left rail) + main analytics (right) ───────────────
     rail, main_col = st.columns([1, 4], gap="large")
 
     with rail:
         st.markdown('<p class="eyebrow">Market Pulse</p>', unsafe_allow_html=True)
-        for sym, label, color in [
-            ("SPY",  "S&P 500",   ACCENT),
-            ("QQQ",  "NASDAQ",    "#42a5f5"),
-            ("DJIA", "Dow Jones", "#ab47bc"),
-        ]:
-            idx_df = load_index(sym)
-            if idx_df.empty:
-                st.markdown(f'<span class="muted">{label}: no data</span>',
-                            unsafe_allow_html=True)
-                continue
-            st.plotly_chart(make_index_line(idx_df, label, color),
-                            use_container_width=True, key=f"idx_{sym}",
-                            config={"displayModeBar": False})
+        for group_label, items in MARKET_PULSE:
+            st.markdown(f'<p class="rail-group">{group_label}</p>',
+                        unsafe_allow_html=True)
+            for sym, label, color in items:
+                idx_df = _df_or_empty(f"idx:{sym}")
+                if idx_df.empty:
+                    st.markdown(f'<span class="muted">{label}: no data</span>',
+                                unsafe_allow_html=True)
+                    continue
+                st.plotly_chart(make_index_line(idx_df, label, color),
+                                use_container_width=True, key=f"idx_{sym}",
+                                config={"displayModeBar": False})
 
     with main_col:
         # Search + indicator controls
         c_search, c_ind = st.columns([2, 3], gap="medium")
         with c_search:
-            universe = load_symbol_universe()
+            universe = _df_or_empty("universe")
             symbols = universe["symbol"].tolist() if not universe.empty else []
             if st.session_state.symbol not in symbols:
                 symbols = [st.session_state.symbol] + symbols
@@ -780,10 +900,29 @@ def main():
             )
             st.session_state.indicators = picked
 
+        # OHLCV was prefetched in parallel for the *current* range; refetch only
+        # if the symbol or range has since changed (cache makes this cheap).
+        df = _df_or_empty("ohlcv")
+        if df.empty or st.session_state.symbol != symbol:
+            df = load_ohlcv(st.session_state.symbol, days=chart_days)
         symbol = st.session_state.symbol
-        df = load_ohlcv(symbol, days=365)
         meta = load_symbol_meta(symbol)
         render_meta_strip(symbol, meta, df)
+
+        # Range presets — sit just above the chart, right-aligned visually
+        _, c_range = st.columns([3, 2], gap="small")
+        with c_range:
+            new_range = st.radio(
+                "Range",
+                options=RANGE_OPTIONS,
+                index=RANGE_OPTIONS.index(st.session_state.chart_range),
+                horizontal=True,
+                label_visibility="collapsed",
+                key="chart_range_radio",
+            )
+            if new_range != st.session_state.chart_range:
+                st.session_state.chart_range = new_range
+                st.rerun()
 
         if df.empty:
             st.warning(f"No price data found for **{symbol}**.")
