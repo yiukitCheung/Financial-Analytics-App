@@ -107,6 +107,23 @@ html, body, [data-testid="stAppViewContainer"] {{
     margin: 12px 0 4px 2px;
 }}
 
+/* Section header (used by Picks of the Day and similar) */
+.section-head {{ margin: 4px 0 16px; }}
+.section-title {{
+    display: inline-flex; align-items: center; gap: 10px;
+    font-size: 22px; font-weight: 700; letter-spacing: -0.01em;
+    color: #ffffff;
+}}
+.section-title::before {{
+    content: ""; width: 4px; height: 22px; border-radius: 3px;
+    background: linear-gradient(180deg, {ACCENT} 0%, #00a583 100%);
+    display: inline-block;
+}}
+.section-sub {{
+    color: {MUTED}; font-size: 13.5px; line-height: 1.55;
+    max-width: 880px; margin: 6px 0 0 14px;
+}}
+
 /* Range preset radio → segmented-control look */
 div[data-testid="stRadio"] > div[role="radiogroup"] {{
     flex-direction: row !important; gap: 0 !important;
@@ -959,7 +976,19 @@ def main():
     st.markdown("<hr/>", unsafe_allow_html=True)
 
     # ── Bottom: Picks of the Day ─────────────────────────────────────────────
-    st.markdown('<p class="eyebrow">Picks of the Day</p>', unsafe_allow_html=True)
+    st.markdown(
+        """
+        <div class="section-head">
+          <div class="section-title">Picks of the Day</div>
+          <div class="section-sub">
+            The day's top-ranked signals from each strategy, with the price at
+            the moment they were picked and the live return-to-date so you can
+            see how the call is playing out. Pick a date or strategy to dig in.
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     latest_dt, strategies = discover_pick_context()
     if latest_dt is None and not strategies:
@@ -969,6 +998,7 @@ def main():
 
     default_dt = latest_dt or date.today()
     strategy_options = ["All strategies"] + strategies
+    topn_options = [10, 25, 50, 100]
 
     c_date, c_strat, c_count = st.columns([1.2, 1.5, 1], gap="medium")
     with c_date:
@@ -990,7 +1020,9 @@ def main():
         )
         strategy = None if strategy_label == "All strategies" else strategy_label
     with c_count:
-        top_n = st.selectbox("Top N", [10, 25, 50, 100], index=1, key="pick_topn")
+        top_n = st.selectbox(
+            "Top N", topn_options, index=topn_options.index(10), key="pick_topn",
+        )
 
     picks = load_picks(scan_dt, strategy, limit=top_n)
 
