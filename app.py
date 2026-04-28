@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Optional
 
 import numpy as np
@@ -279,18 +279,18 @@ def api_health() -> dict:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_symbol_universe(limit: int = 500) -> pd.DataFrame:
-    """Top-N symbols by market cap (one page) for the search dropdown.
+def load_top_symbols(limit: int = 10) -> pd.DataFrame:
+    """Top-N common stocks by market cap, used as the quick-pick dropdown.
 
-    Cached for an hour. Picks whose symbol is outside this list are still
-    enriched on demand via `/market/quote/{symbol}` in `_enrich_picks`, so
-    nothing is lost by skipping deep pagination.
+    Single small screener call (was 500 rows; now 10 by default) so cold-start
+    is fast. Anything the user types in the search bar is fetched on demand
+    via `/market/ohlcv/{symbol}` and `/market/quote/{symbol}` (both cached).
     """
     payload = _api_get(
         "/screener/quotes",
         params={
             "type": "CS",
-            "limit": min(max(limit, 1), 500),
+            "limit": min(max(limit, 1), 50),
             "offset": 0,
             "sort": "marketcap:desc",
         },
@@ -306,11 +306,22 @@ def load_symbol_universe(limit: int = 500) -> pd.DataFrame:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def load_ohlcv(symbol: str, days: int = 365) -> pd.DataFrame:
+    """Daily OHLCV for the most recent `days` calendar days, ascending.
+
+    Uses an explicit `[start_date, end_date]` window. Without a window the API
+    interprets `sort=asc&limit=N` as "the oldest N rows", which yields years-old
+    data for any range > a few weeks. Sending the window guarantees the chart
+    ends on the latest trading day.
+    """
+    today = date.today()
+    start = today - timedelta(days=max(days, 1))
     payload = _api_get(
         f"/market/ohlcv/{symbol}",
         params={
             "interval": "1d",
-            "limit": min(max(days, 1), 2000),
+            "start_date": start.isoformat(),
+            "end_date": today.isoformat(),
+            "limit": 2000,
             "sort": "asc",
         },
     )
@@ -336,17 +347,22 @@ def load_index(symbol: str, days: int = 90) -> pd.DataFrame:
 
 @st.cache_data(ttl=600, show_spinner=False)
 def load_symbol_meta(symbol: str) -> dict:
-    """Fast path: pull from cached universe; fall back to /market/quote/{symbol}."""
-    universe = load_symbol_universe()
-    hit = universe.loc[universe["symbol"] == symbol]
-    if not hit.empty:
-        row = hit.iloc[0].to_dict()
-        return {
-            "name": row.get("name"),
-            "industry": row.get("industry"),
-            "marketcap": row.get("market_cap"),
-            "primary_exchange": row.get("primary_exchange"),
-        }
+    """Per-symbol metadata. Tries the cached top-symbols list first as a free
+    hit, otherwise calls /market/quote/{symbol}.
+    """
+    try:
+        top = load_top_symbols()
+        hit = top.loc[top["symbol"] == symbol] if not top.empty else top
+        if not hit.empty:
+            row = hit.iloc[0].to_dict()
+            return {
+                "name": row.get("name"),
+                "industry": row.get("industry"),
+                "marketcap": row.get("market_cap"),
+                "primary_exchange": row.get("primary_exchange"),
+            }
+    except APIError:
+        pass
     try:
         payload = _api_get(f"/market/quote/{symbol}")
         d = payload.get("data") or {}
@@ -376,43 +392,23 @@ def load_picks_returns(scan_dt: date, horizons: str = "1,5,21") -> dict:
 
 
 def _enrich_picks(picks_df: pd.DataFrame) -> pd.DataFrame:
-    """Attach name + industry + market_cap to each pick using the cached
-    universe first, then per-symbol /market/quote fallback for misses."""
+    """Attach name + industry + market_cap to each pick via parallel
+    /market/quote lookups. `load_symbol_meta` is cached and tries the cached
+    top-symbols list as a free fast-path before hitting the API.
+    """
     if picks_df.empty:
         return picks_df
-    universe = load_symbol_universe()
-    uni = universe.set_index("symbol") if not universe.empty else pd.DataFrame()
 
-    names, industries, caps = [], [], []
-    misses: list[str] = []
-    for sym in picks_df["symbol"]:
-        if not uni.empty and sym in uni.index:
-            r = uni.loc[sym]
-            names.append(r.get("name"))
-            industries.append(r.get("industry"))
-            caps.append(r.get("market_cap"))
-        else:
-            names.append(None)
-            industries.append(None)
-            caps.append(None)
-            misses.append(sym)
-
-    if misses:
-        def _fetch(sym: str) -> tuple[str, dict]:
-            return sym, load_symbol_meta(sym)
-        with ThreadPoolExecutor(max_workers=8) as ex:
-            for sym, meta in ex.map(_fetch, misses):
-                idx = picks_df.index[picks_df["symbol"] == sym]
-                for i in idx:
-                    pos = picks_df.index.get_loc(i)
-                    names[pos] = meta.get("name")
-                    industries[pos] = meta.get("industry")
-                    caps[pos] = meta.get("marketcap")
+    syms = picks_df["symbol"].tolist()
+    metas: dict[str, dict] = {}
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(syms)))) as ex:
+        for sym, meta in zip(syms, ex.map(load_symbol_meta, syms)):
+            metas[sym] = meta or {}
 
     out = picks_df.copy()
-    out["name"] = names
-    out["industry"] = industries
-    out["marketcap"] = caps
+    out["name"] = [metas.get(s, {}).get("name") for s in syms]
+    out["industry"] = [metas.get(s, {}).get("industry") for s in syms]
+    out["marketcap"] = [metas.get(s, {}).get("marketcap") for s in syms]
     return out
 
 
@@ -843,7 +839,7 @@ def main():
 
     with st.spinner("Loading market data…"):
         preload = _parallel({
-            "universe":    (load_symbol_universe, (), None),
+            "top_symbols": (load_top_symbols, (), {"limit": 10}),
             "ohlcv":       (load_ohlcv, (symbol, chart_days), None),
             "picks_today": (load_picks_today, (), {"limit": 200}),
             **{f"idx:{s}": (load_index, (s, 90), None) for s in pulse_symbols},
@@ -872,24 +868,44 @@ def main():
                                 config={"displayModeBar": False})
 
     with main_col:
-        # Search + indicator controls
-        c_search, c_ind = st.columns([2, 3], gap="medium")
+        top_symbols_df = _df_or_empty("top_symbols")
+        top_symbols = (top_symbols_df["symbol"].tolist()
+                       if not top_symbols_df.empty else [])
+
+        def _on_search_submit():
+            val = (st.session_state.get("sym_search") or "").strip().upper()
+            if val and val != st.session_state.symbol:
+                st.session_state.symbol = val
+
+        def _on_quick_pick():
+            v = st.session_state.get("sym_quick")
+            if v and v != st.session_state.symbol:
+                st.session_state.symbol = v
+
+        c_search, c_quick, c_ind = st.columns([1.4, 1.2, 2.4], gap="medium")
         with c_search:
-            universe = _df_or_empty("universe")
-            symbols = universe["symbol"].tolist() if not universe.empty else []
-            if st.session_state.symbol not in symbols:
-                symbols = [st.session_state.symbol] + symbols
-            idx = symbols.index(st.session_state.symbol)
-            chosen = st.selectbox(
+            st.text_input(
                 "Search symbol",
-                symbols,
-                index=idx,
-                key="sym_select",
-                help="Type to search any US common stock",
+                value="",
+                placeholder="Type a ticker (e.g. AAPL) and press Enter",
+                key="sym_search",
+                on_change=_on_search_submit,
+                help="Press Enter to load. Any US ticker works.",
             )
-            if chosen != st.session_state.symbol:
-                st.session_state.symbol = chosen
-                st.rerun()
+        with c_quick:
+            quick_options = list(top_symbols)
+            if st.session_state.symbol in quick_options:
+                quick_index = quick_options.index(st.session_state.symbol)
+            else:
+                quick_index = 0
+            st.selectbox(
+                "Quick pick — top 10",
+                options=quick_options or [st.session_state.symbol],
+                index=quick_index,
+                key="sym_quick",
+                on_change=_on_quick_pick,
+                help="Top 10 US common stocks by market cap.",
+            )
         with c_ind:
             picked = st.multiselect(
                 f"Indicators (max {MAX_INDICATORS})",
@@ -904,9 +920,16 @@ def main():
         # if the symbol or range has since changed (cache makes this cheap).
         df = _df_or_empty("ohlcv")
         if df.empty or st.session_state.symbol != symbol:
-            df = load_ohlcv(st.session_state.symbol, days=chart_days)
+            try:
+                df = load_ohlcv(st.session_state.symbol, days=chart_days)
+            except APIError as e:
+                df = pd.DataFrame()
+                st.error(f"Couldn't load **{st.session_state.symbol}** — {e}")
         symbol = st.session_state.symbol
-        meta = load_symbol_meta(symbol)
+        try:
+            meta = load_symbol_meta(symbol)
+        except APIError:
+            meta = {}
         render_meta_strip(symbol, meta, df)
 
         # Range presets — sit just above the chart, right-aligned visually
