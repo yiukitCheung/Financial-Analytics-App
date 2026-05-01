@@ -800,8 +800,12 @@ def render_picks_table(picks: pd.DataFrame, scan_dt: date) -> None:
     for i, (_, r) in enumerate(picks.iterrows()):
         if i >= len(cols):
             break
+        # Same symbol can appear under multiple strategies on the same date,
+        # so the key must include row index + strategy + rank to stay unique.
+        strat = (r.get("strategy_name") or "any")
+        key = f"open_{i}_{r['symbol']}_{strat}_{int(r['rank'])}_{scan_dt}"
         with cols[i]:
-            if st.button(f"Open {r['symbol']}", key=f"open_{r['symbol']}_{scan_dt}"):
+            if st.button(f"Open {r['symbol']}", key=key):
                 st.session_state.symbol = r["symbol"]
                 st.rerun()
 
